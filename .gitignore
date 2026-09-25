@@ -1,0 +1,16 @@
+student_resource/
+data/
+work/
+output/
+logs/
+.venv/
+.er_env
+__pycache__/
+*.npy
+*.pkl
+*.zip
+
+# run logs (can contain dataset records - never publish)
+logs_*.txt
+*.log
+download.txt

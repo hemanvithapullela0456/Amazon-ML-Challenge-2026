@@ -1,0 +1,13 @@
+numpy
+pandas
+polars
+pyarrow
+scikit-learn
+joblib
+Unidecode
+transformers>=4.44,<5
+sentencepiece
+tiktoken
+protobuf
+peft>=0.12
+accelerate
