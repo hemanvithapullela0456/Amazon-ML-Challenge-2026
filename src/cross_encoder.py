@@ -183,6 +183,9 @@ def main():
     ap.add_argument("--tag", default="", help="suffix for output files, e.g. _xlmr, _qwen")
     ap.add_argument("--only_folds", default="",
                     help="comma list of CE folds to run, e.g. '1' or '0,2' (one fold per process/account)")
+    ap.add_argument("--test_folds", default="",
+                    help="comma list of folds whose model scores the test pairs (default: every fold run); "
+                         "'0' scores test once instead of once per fold - 1/3 of the test cost for slow models")
     ap.add_argument("--guard_step", type=int, default=1500,
                     help="if the loss is still at chance at this step, restart the fold at 0.6x lr (0 = off)")
     ap.add_argument("--guard_loss", type=float, default=0.685)
@@ -222,6 +225,10 @@ def main():
         folds = sorted(int(x) for x in a.only_folds.split(","))
     else:
         folds = list(range(a.folds))
+    test_folds = [int(x) for x in a.test_folds.split(",")] if a.test_folds else folds
+    test_folds = [f for f in folds if f in test_folds]
+    if te_pairs is not None and not test_folds:
+        raise SystemExit(f"--test_folds {a.test_folds} names no fold that this run trains ({folds})")
     for f in folds:
         t = time.time()
         tr = tr_pairs.filter(pl.col("cefold") != f)
@@ -255,10 +262,10 @@ def main():
         if 0 < y.sum() < len(y):
             print(f"fold {f}: CE AUC {roc_auc_score(y, ce_tr[va_mask]):.4f} | stage-1 AUC on same pairs "
                   f"{roc_auc_score(y, va['prob'].to_numpy()):.4f} ({time.time() - t:.0f}s)", flush=True)
-        if te_pairs is not None:
+        if te_pairs is not None and f in test_folds:
             tl = make_loader(tok, te_texts, te_pairs["i"].to_numpy(), te_pairs["j"].to_numpy(), None,
                              a.bs * 4, a.max_len, False, a.lora)
-            ce_te += predict(model, tl, te_pairs.height, dev, amp) / len(folds)
+            ce_te += predict(model, tl, te_pairs.height, dev, amp) / len(test_folds)
             print(f"fold {f}: test scored ({time.time() - t:.0f}s, total {time.time() - t0:.0f}s)", flush=True)
         del model
         if dev == "cuda":
