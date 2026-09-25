@@ -84,13 +84,16 @@ def main():
     ap.add_argument("--dense", default="", help="dense pairs parquet to union in (e.g. work/dense_test.parquet)")
     ap.add_argument("--unseen_t", type=float, default=None,
                     help="stricter match threshold for test countries that never appear in training")
+    ap.add_argument("--stage2_tag", default="", help="with --stage2: which reranker's stacked scores, e.g. _xlmr")
+    ap.add_argument("--unseen_scores", default="", help="with --reuse: parquet (i, j, prob) replacing the scores "
+                    "of unseen-country S1s, e.g. work/test_scored_unseen.parquet from unseen_model.py")
     ap.add_argument("--note", default="", help="description for output/runs/RUNS.md")
     ap.add_argument("--reuse", action="store_true", help="reuse work/test_scored.parquet (only re-decide)")
     ap.add_argument("--stage2", action="store_true", help="with --reuse: use the stacked (cross-encoder) scores")
     a = ap.parse_args()
 
     if a.reuse:
-        tag = "_stage2" if a.stage2 else ""
+        tag = ("_stage2" + a.stage2_tag) if a.stage2 else ""
         with open(os.path.join(C.WORK_DIR, f"decision{tag}.json")) as f:
             cfg = json.load(f)
         recs = load_records("test")
@@ -99,9 +102,22 @@ def main():
     else:
         recs, s1, scored, cfg = score_test(a.k, a.chunk, a.n_jobs, resume=not a.no_resume, dense=a.dense)
     print(f"decision: { {k: v for k, v in cfg.items() if k != 'features'} }")
+    unseen_cfg = cfg
+    if a.unseen_scores:
+        # replace the unseen-country S1s' scores by those of a separately trained matcher (unseen_model.py);
+        # those scores are stage-1 probabilities, so they are decided with the stage-1 rule
+        alt = pl.read_parquet(a.unseen_scores)
+        alt_i = alt["i"].unique()
+        scored = pl.concat([scored.filter(~pl.col("i").is_in(alt_i.implode())), alt.select(scored.columns)])
+        with open(os.path.join(C.WORK_DIR, "decision.json")) as f:
+            unseen_cfg = json.load(f)
+        print(f"unseen-country scores from {a.unseen_scores}: {alt_i.len()} S1 replaced", flush=True)
 
     df = scored.to_pandas()
     df["pred"] = decide.predict_mask(df, cfg)
+    if a.unseen_scores:
+        alt_mask = df["i"].isin(alt_i.to_numpy()).values
+        df.loc[alt_mask, "pred"] = decide.predict_mask(df[alt_mask], unseen_cfg)
     if a.unseen_t is not None:
         # countries absent from training are a distribution shift (their look-alike businesses fool a model
         # tuned on the training countries), so demand a higher probability there. Decided per country label

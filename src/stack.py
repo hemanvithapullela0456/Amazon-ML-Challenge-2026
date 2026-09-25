@@ -2,7 +2,8 @@
 
 Needs work/train_oof.parquet, work/test_scored.parquet, work/ce_train.parquet, work/ce_test.parquet.
 Pairs the cross-encoder did not score keep ce = NaN (LightGBM handles it).
-Usage:  python src/stack.py [--suffix _smoke]
+Usage:  python src/stack.py --tag _xlmr        (full: ce_train_xlmr + ce_test_xlmr -> test_scored_stage2_xlmr)
+        python src/stack.py --suffix _eval_x   (evaluation only, on the S1s the eval run scored)
 """
 import argparse
 import json
@@ -40,13 +41,15 @@ def stack_features(df, ce):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suffix", default="")
+    ap.add_argument("--suffix", default="", help="evaluation-only run on ce_train<suffix> (no test output)")
+    ap.add_argument("--tag", default="", help="full run: ce_train<tag>/ce_test<tag> -> test_scored_stage2<tag>")
+    ap.add_argument("--eval_only", action="store_true", help="with --tag: stop after the validation score")
     ap.add_argument("--no-expected", action="store_true", help="skip the (slow) expected-F0.5 selector while tuning")
     a = ap.parse_args()
     W = C.WORK_DIR
     oof = pl.read_parquet(os.path.join(W, "train_oof.parquet"))
     G_pl = pl.read_parquet(os.path.join(W, "train_G.parquet"))
-    ce_tr = pl.read_parquet(os.path.join(W, f"ce_train{a.suffix}.parquet")).drop_nulls("ce").filter(pl.col("ce").is_not_nan())
+    ce_tr = pl.read_parquet(os.path.join(W, f"ce_train{a.suffix or a.tag}.parquet")).drop_nulls("ce").filter(pl.col("ce").is_not_nan())
     tr = stack_features(oof, ce_tr)
     if a.suffix:  # smoke: evaluate only on S1s the CE saw
         tr = tr.filter(pl.col("i").is_in(ce_tr["i"].unique()))
@@ -77,14 +80,14 @@ def main():
     print("stage-2 decision tuning:")
     cfg = decide.tune(df, G, s1_ids, try_expected=not a.no_expected)
     print(f"stage-1 F0.5 on these S1: {base:.5f}  ->  stage-2 F0.5: {cfg['cv_f05']:.5f}")
-    if a.suffix:
+    if a.suffix or a.eval_only:
         return
 
     n_rounds = int(np.mean(iters) * 1.1) + 1
     model = lgb.train(params, lgb.Dataset(df[FEATS], df["label"].astype(int)), n_rounds)
     # test set: 49.6M pairs, so score in S1 chunks (all features are within-S1, so chunking is exact)
     scored = pl.read_parquet(os.path.join(W, "test_scored.parquet"))
-    ce_te = pl.read_parquet(os.path.join(W, "ce_test.parquet"))
+    ce_te = pl.read_parquet(os.path.join(W, f"ce_test{a.tag}.parquet"))
     s1 = scored["i"].unique().sort()
     parts, step = [], 300_000
     for a0 in range(0, len(s1), step):
@@ -93,11 +96,11 @@ def main():
         p2 = model.predict(f.select(FEATS).to_numpy())
         parts.append(f.select("i", "j").with_columns(pl.Series("prob", p2.astype(np.float32))))
         print(f"  stage-2 scored S1 {min(a0 + step, len(s1))}/{len(s1)}", flush=True)
-    pl.concat(parts).write_parquet(os.path.join(W, "test_scored_stage2.parquet"))
+    pl.concat(parts).write_parquet(os.path.join(W, f"test_scored_stage2{a.tag}.parquet"))
     cfg.update(features=FEATS, n_rounds=n_rounds, stage=2)
-    with open(os.path.join(W, "decision_stage2.json"), "w") as f:
+    with open(os.path.join(W, f"decision_stage2{a.tag}.json"), "w") as f:
         json.dump(cfg, f, indent=1)
-    print("saved work/test_scored_stage2.parquet -> python src/run_pipeline.py --reuse --stage2")
+    print(f"saved work/test_scored_stage2{a.tag}.parquet -> python src/run_pipeline.py --reuse --stage2 --stage2_tag {a.tag}")
 
 
 if __name__ == "__main__":
