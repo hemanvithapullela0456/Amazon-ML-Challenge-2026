@@ -6,7 +6,7 @@ Same held-out S1s for every row of a table. Fill in as results arrive.
 | Run | Blocking recall@30 | OOF F0.5 | US | India | US→India | India→US | Public LB |
 |---|---|---|---|---|---|---|---|
 | key blocking + ranker, 200k S1 | 0.9426 | 0.9598 (t=0.70, 1:1) | 0.9707 | 0.9433 | | | **0.948** (implies France ≈ 0.90) |
-| **key-30 + dense-10**, 200k S1 (ceiling 0.9958) | 0.9958 | **0.9829** (t=0.75, 1:1) | 0.9831 | 0.9827 | | | |
+| **key-30 + dense-10**, 200k S1 (ceiling 0.9958) | 0.9958 | **0.9829** (t=0.75, 1:1) | 0.9831 | 0.9827 | | | **0.97** (run2; implies France ≈ 0.89) |
 
 ## Track A — retrieval (recall on the 10% blocking-eval S1s)
 | Run | dense@10 | dense@20 | key@30 | union key30+dense10 | union key30+dense20 | India union |

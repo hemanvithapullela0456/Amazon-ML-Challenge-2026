@@ -19,7 +19,7 @@ import config as C
 import decide
 from blocking import add_competition, add_dense, build_keys, candidates, load_ranker, load_records
 from features import idf_tables, make_features
-from io_utils import write_id_lists
+from io_utils import archive_run, write_id_lists
 from train import norm_table
 
 
@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--n_jobs", type=int, default=4, help="worker processes for feature scoring")
     ap.add_argument("--no-resume", action="store_true", help="ignore work/test_scored_parts checkpoints")
     ap.add_argument("--dense", default="", help="dense pairs parquet to union in (e.g. work/dense_test.parquet)")
+    ap.add_argument("--unseen_t", type=float, default=None,
+                    help="stricter match threshold for test countries that never appear in training")
+    ap.add_argument("--note", default="", help="description for output/runs/RUNS.md")
     ap.add_argument("--reuse", action="store_true", help="reuse work/test_scored.parquet (only re-decide)")
     ap.add_argument("--stage2", action="store_true", help="with --reuse: use the stacked (cross-encoder) scores")
     a = ap.parse_args()
@@ -99,6 +102,18 @@ def main():
 
     df = scored.to_pandas()
     df["pred"] = decide.predict_mask(df, cfg)
+    if a.unseen_t is not None:
+        # countries absent from training are a distribution shift (their look-alike businesses fool a model
+        # tuned on the training countries), so demand a higher probability there. Decided per country label
+        # seen/unseen in train - no country is named in the code.
+        seen = set(pl.read_parquet(os.path.join(C.WORK_DIR, "train_G.parquet"))["country_key"].unique().to_list())
+        s1r = recs.filter(pl.col("source") == 1)
+        cmap = dict(zip(s1r["r"].to_list(), s1r["country_key"].to_list()))
+        unseen = ~df["i"].map(cmap).isin(seen).values
+        before = int(df["pred"].sum())
+        df["pred"] = df["pred"].values & (~unseen | (df["prob"].values >= a.unseen_t))
+        print(f"unseen-country threshold {a.unseen_t}: countries {sorted(set(cmap.values()) - seen)} | "
+              f"dropped {before - int(df['pred'].sum())} predicted pairs")
     ids = recs["entity_id"].to_numpy()
     s1_ids = ids[s1]
     cand = df.groupby("i")["j"].apply(lambda s: ids[s.values].tolist()).to_dict()
@@ -115,6 +130,10 @@ def main():
     write_id_lists(os.path.join(C.OUT_DIR, "matching_results.tsv"), s1_ids, match, "matched_entity_ids")
     write_id_lists(os.path.join(C.OUT_DIR, "candidate_pairs.tsv"), s1_ids, cand, "candidate_entity_ids")
     run_validator()
+    stats = " ".join(f"{c} {np.mean(n[ctry == c] == 0):.3f}/{n[ctry == c].mean():.2f}" for c in np.unique(ctry))
+    archive_run(os.path.join(C.OUT_DIR, "matching_results.tsv"),
+                a.note or f"{'stage2 ' if a.stage2 else 'stage1 '}"
+                          f"cv {cfg.get('cv_f05', float('nan')):.4f}; singletons/matches {stats}")
 
 
 if __name__ == "__main__":

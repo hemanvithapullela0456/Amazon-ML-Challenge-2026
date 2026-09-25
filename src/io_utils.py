@@ -57,6 +57,29 @@ def write_id_lists(path, s1_ids, lists, col):
     print(f"wrote {path} ({len(s1_ids)} rows)")
 
 
+def archive_run(matching_path, note, runs_dir=None):
+    """Copy a finished matching_results.tsv to <out>/runs/runN_matching_results.tsv (N = next free number)
+    and append a line to runs/RUNS.md, so every submission candidate is kept under a stable name."""
+    import re
+    import shutil
+    import time
+    from config import OUT_DIR
+    runs_dir = runs_dir or os.path.join(OUT_DIR, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    nums = [int(m.group(1)) for f in os.listdir(runs_dir) if (m := re.match(r"run(\d+)_", f))]
+    n = max(nums, default=0) + 1
+    dst = os.path.join(runs_dir, f"run{n}_matching_results.tsv")
+    shutil.copyfile(matching_path, dst)
+    log = os.path.join(runs_dir, "RUNS.md")
+    if not os.path.exists(log):
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("| run | saved | what | leaderboard |\n|---|---|---|---|\n")
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(f"| run{n} | {time.strftime('%Y-%m-%d %H:%M')} | {note.replace('|', ';')} | |\n")
+    print(f"archived -> {dst}")
+    return dst
+
+
 def write_submission(out_dir, s1_ids, matches, candidates):
     # final matches must be a subset of candidates
     for s1, m in matches.items():
