@@ -94,13 +94,30 @@ def encode_texts(tok, texts):
     return dict(zip(keys, enc))
 
 
+SCR = {"p": 0.0, "tok_p": 0.7, "pool": None, "keep": None}   # vocabulary scrambling (training only)
+
+
+def scramble_setup(tok, p, tok_p=0.7):
+    """Delexicalised training (McDonald et al. 2011 style): per list, alphabetic sub-words are replaced by random
+    sub-words CONSISTENTLY across the S1 and all its candidates, so the model sees which records share tokens but
+    not which words they are. Digits, punctuation and special tokens are kept."""
+    vocab = tok.convert_ids_to_tokens(list(range(len(tok))))
+    alpha = np.array([n for n, t in enumerate(vocab) if t and t.strip("▁").isalpha() and len(t.strip("▁")) >= 2])
+    SCR.update(p=p, tok_p=tok_p, pool=alpha, keep=set(n for n, t in enumerate(vocab) if not (t and t.strip("▁").isalpha())))
+
+
 def build(tok, cand_id, toks, s1, cands, rng=None):
     order = np.arange(len(cands)) if rng is None else rng.permutation(len(cands))
-    ids = [tok.cls_token_id] + toks[s1][:S1_TOK] + [tok.sep_token_id]
+    recs = [toks[s1][:S1_TOK]] + [toks[cands[k]][:C_TOK] for k in order]
+    if rng is not None and SCR["p"] > 0 and rng.random() < SCR["p"]:
+        uniq = {t for r in recs for t in r if t not in SCR["keep"]}
+        mp = {t: int(SCR["pool"][rng.integers(len(SCR["pool"]))]) for t in uniq if rng.random() < SCR["tok_p"]}
+        recs = [[mp.get(t, t) for t in r] for r in recs]
+    ids = [tok.cls_token_id] + recs[0] + [tok.sep_token_id]
     pos = []
-    for k in order:
+    for r in recs[1:]:
         pos.append(len(ids))
-        ids += [cand_id] + toks[cands[k]][:C_TOK] + [tok.sep_token_id]
+        ids += [cand_id] + r + [tok.sep_token_id]
     return ids, pos, order
 
 
@@ -168,18 +185,23 @@ def main():
     ap.add_argument("--pseudo_n", type=int, default=120_000, help="target lists sampled into training")
     ap.add_argument("--test_country", default="", help="score only test lists of this country_key")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--scramble", type=float, default=0.0, help="share of training lists whose vocabulary is scrambled")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--train_country", default="", help="train only on this country's lists (transfer test)")
+    ap.add_argument("--test_lists", default="test_lists.parquet")
+    ap.add_argument("--test_texts", default="test_texts.parquet")
     a = ap.parse_args()
     if a.export:
         return export(a)
     dev = "cuda"
-    torch.manual_seed(C.SEED)
+    torch.manual_seed(C.SEED + a.seed)
     os.makedirs(a.out_dir, exist_ok=True)
     t0 = time.time()
     tr = pl.read_parquet(os.path.join(a.bundle, "train_lists.parquet")).sort("i", "prob", descending=[False, True])
     ids = tr["i"].unique().sort().to_numpy()   # same S1 folds as cross_encoder.py (3 folds, SEED)
     fold_of = dict(zip(ids.tolist(), (np.random.default_rng(C.SEED).permutation(len(ids)) % 3).tolist()))
     tr = tr.with_columns(pl.col("i").replace_strict(fold_of, return_dtype=pl.Int32).alias("cefold"))
-    te = None if a.no_test else pl.read_parquet(os.path.join(a.bundle, "test_lists.parquet")).sort("i", "prob", descending=[False, True])
+    te = None if a.no_test else pl.read_parquet(os.path.join(a.bundle, a.test_lists)).sort("i", "prob", descending=[False, True])
     if te is not None and a.test_country:
         te = te.filter(pl.col("country_key") == a.test_country)
     if a.smoke:
@@ -189,16 +211,22 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     tok.add_special_tokens({"additional_special_tokens": ["[CAND]"]})
     cand_id = tok.convert_tokens_to_ids("[CAND]")
+    if a.scramble > 0:
+        scramble_setup(tok, a.scramble)
+        print(f"vocabulary scrambling on {a.scramble:.0%} of training lists ({len(SCR['pool'])} replacement sub-words)", flush=True)
     texts = pl.read_parquet(os.path.join(a.bundle, "train_texts.parquet"))
     toks = encode_texts(tok, dict(zip(texts["r"].to_list(), texts["text"].to_list())))
-    fit_l = to_lists(tr.filter(pl.col("cefold") != 0), True)
+    fit = tr.filter(pl.col("cefold") != 0)
+    if a.train_country:
+        fit = fit.filter(pl.col("country_key") == a.train_country)
+    fit_l = to_lists(fit, True)
     if a.pseudo:
         ps = pl.read_parquet(a.pseudo)
         keep = ps["i"].unique().sample(min(a.pseudo_n, ps["i"].n_unique()), seed=C.SEED)
-        tl = pl.read_parquet(os.path.join(a.bundle, "test_lists.parquet")).filter(pl.col("i").is_in(keep.implode()))
+        tl = pl.read_parquet(os.path.join(a.bundle, a.test_lists)).filter(pl.col("i").is_in(keep.implode()))
         ps = tl.select("i", "j", "prob").join(ps, on=["i", "j"], how="left").sort("i", "prob", descending=[False, True])
         ps = ps.with_columns(pl.col("pl_label").fill_null(float("nan")))
-        tt = pl.read_parquet(os.path.join(a.bundle, "test_texts.parquet")).filter(
+        tt = pl.read_parquet(os.path.join(a.bundle, a.test_texts)).filter(
             pl.col("r").is_in(pl.concat([ps["i"], ps["j"]]).unique().implode()))
         # target records live in the TEST row space: offset their ids so they never collide with train rows
         OFF = 1 << 30
@@ -212,7 +240,7 @@ def main():
     print(f"train lists {len(fit_l)} | validation lists {len(val_l)} | tokenized ({time.time() - t0:.0f}s)", flush=True)
 
     model = SetModel(a.model, len(tok)).to(dev)
-    loader = make_loader(tok, cand_id, toks, fit_l, a.bs, True)
+    loader = make_loader(tok, cand_id, toks, fit_l, a.bs, True, seed=1000 * a.seed)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
     steps = a.epochs * len(loader)
     sch = get_linear_schedule_with_warmup(opt, int(0.05 * steps), steps)
@@ -240,7 +268,7 @@ def main():
           f"stage-1 AUC on same pairs {roc_auc_score(band['label'], band['prob']):.4f} ({time.time() - t0:.0f}s)", flush=True)
     if te is None:
         return
-    texts = pl.read_parquet(os.path.join(a.bundle, "test_texts.parquet"))
+    texts = pl.read_parquet(os.path.join(a.bundle, a.test_texts))
     toks = encode_texts(tok, dict(zip(texts["r"].to_list(), texts["text"].to_list())))
     te_l = to_lists(te, False)
     ts = score(model, make_loader(tok, cand_id, toks, te_l, a.bs * 4, False), te_l, dev)
