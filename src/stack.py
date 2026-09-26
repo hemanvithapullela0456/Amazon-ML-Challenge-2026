@@ -60,6 +60,10 @@ def main():
     ap.add_argument("--suffix", default="", help="evaluation-only run on ce_train<suffix> (no test output)")
     ap.add_argument("--tag", default="", help="full run: ce_train<tag>/ce_test<tag> -> test_scored_stage2<tag>")
     ap.add_argument("--eval_only", action="store_true", help="with --tag: stop after the validation score")
+    ap.add_argument("--restrict", action="store_true",
+                    help="full run: fit the stack only on S1s the FIRST reranker scored (one that has OOF on one fold only)")
+    ap.add_argument("--graph", action="store_true", help="add graph/consensus features (work/graph_{train,test}.parquet)")
+    ap.add_argument("--moves", action="store_true", help="add generator-move / alias features (work/moves_{train,test}.parquet)")
     ap.add_argument("--no-expected", action="store_true", help="skip the (slow) expected-F0.5 selector while tuning")
     a = ap.parse_args()
     W = C.WORK_DIR
@@ -72,7 +76,20 @@ def main():
               for t in tags]
     ce_tr = ce_trs[0]
     tr = stack_features(oof, ce_trs, names)
-    if a.suffix:  # smoke: evaluate only on S1s the CE saw
+    gfe = []
+    if a.graph:
+        g_tr = pl.read_parquet(os.path.join(W, "graph_train.parquet"))
+        gfe = [c for c in g_tr.columns if c not in ("i", "j")]
+        tr = tr.join(g_tr, on=["i", "j"], how="left")
+        feats = feats + gfe
+        print(f"graph features: {len(gfe)} on {g_tr.height} band pairs")
+    if a.moves:
+        m_tr = pl.read_parquet(os.path.join(W, "moves_train.parquet"))
+        mfe = [c for c in m_tr.columns if c not in ("i", "j")]
+        tr = tr.join(m_tr, on=["i", "j"], how="left")
+        feats = feats + mfe
+        print(f"move features: {len(mfe)}")
+    if a.suffix or a.restrict:  # evaluate / fit only on S1s the first CE saw
         tr = tr.filter(pl.col("i").is_in(ce_tr["i"].unique()))
     df = tr.to_pandas()
     G = pd.Series(G_pl["len"].to_numpy(), index=G_pl["i"].to_numpy())
@@ -109,17 +126,23 @@ def main():
     # test set: 49.6M pairs, so score in S1 chunks (all features are within-S1, so chunking is exact)
     scored = pl.read_parquet(os.path.join(W, "test_scored.parquet"))
     ce_tes = [pl.read_parquet(os.path.join(W, f"ce_test{t}.parquet")) for t in tags]
+    g_te = pl.read_parquet(os.path.join(W, "graph_test.parquet")) if a.graph else None
+    m_te = pl.read_parquet(os.path.join(W, "moves_test.parquet")) if a.moves else None
     s1 = scored["i"].unique().sort()
     parts, step = [], 300_000
     for a0 in range(0, len(s1), step):
         ch = scored.filter(pl.col("i").is_in(s1[a0:a0 + step].implode()))
         f = stack_features(ch, ce_tes, names)
+        if g_te is not None:
+            f = f.join(g_te, on=["i", "j"], how="left")
+        if m_te is not None:
+            f = f.join(m_te, on=["i", "j"], how="left")
         p2 = model.predict(f.select(feats).to_numpy())
         parts.append(f.select("i", "j").with_columns(pl.Series("prob", p2.astype(np.float32))))
         print(f"  stage-2 scored S1 {min(a0 + step, len(s1))}/{len(s1)}", flush=True)
-    pl.concat(parts).write_parquet(os.path.join(W, f"test_scored_stage2{a.tag.replace(',', '')}.parquet"))
+    pl.concat(parts).write_parquet(os.path.join(W, f"test_scored_stage2{a.tag.replace(',', '')}{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}.parquet"))
     cfg.update(features=feats, n_rounds=n_rounds, stage=2)
-    with open(os.path.join(W, f"decision_stage2{a.tag.replace(',', '')}.json"), "w") as f:
+    with open(os.path.join(W, f"decision_stage2{a.tag.replace(',', '')}{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}.json"), "w") as f:
         json.dump(cfg, f, indent=1)
     print(f"saved work/test_scored_stage2{a.tag.replace(',', '')}.parquet -> python src/run_pipeline.py --reuse --stage2 --stage2_tag {a.tag.replace(',', '')}")
 
