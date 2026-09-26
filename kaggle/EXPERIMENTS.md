@@ -75,3 +75,12 @@ Name-only copies per S1 behave like independent noise (0:85%, 1:13.9%, 2:1.1%; S
 | B  MMD lam=1.0 | 0.528 (= base-rate entropy: learned nothing) | 0.536 / 0.774 | 0.498 / 0.853 |
 | C  GRL lam=1.0 | 0.324 | 0.473 / 0.774 | 0.520 / 0.853 |
 => both collapse (MMD: constant representation; GRL: domain loss 1.06 > ln2, over-alignment). Retry only with lam ~0.1.
+
+## France students v3 (teacher-student, France-like simulation, AUC Latin band / veto AUC on teacher-confident pairs)
+XLM-R 0.934 / 0.967 | Qwen3-1.7B LoRA (Jarvis) 0.944 / 0.978 | mDeBERTa-v3-base 0.956 / 0.983
+Fusion on true labels (src/fuse_v3.py): lgbm 0.1 + mDeBERTa 0.9408; mixing students hurts; + veto 2% 0.9447.
+run8 (mDeBERTa + 2% veto) LB 0.976795 < run7 0.977405: the veto removed more true than false matches in the
+simulation too (only 43.6% of vetoed were false) - a thin trade that France tipped negative. Veto dropped.
+
+## US/India stage 2, new rerankers (Jarvis A100, fold 0 of the uncertain-pair bundle)
+mDeBERTa-v3-base 2 ep: CE AUC 0.9555 (Qwen3-0.6B 0.958, stage 1 0.940). Qwen3-1.7B LoRA: pending.

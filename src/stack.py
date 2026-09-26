@@ -20,23 +20,39 @@ import decide
 # Only within-S1 features: a candidate-side "who else wants this record" feature would be computed over the
 # 200k training sample but over all 1.7M S1s at test time, a distribution mismatch. (Stage 1 already carries
 # candidate-side competition, and the decision rule applies one-to-one over everything.)
-FEATS = ["prob", "prob_rank", "prob_gap", "prob_n_above", "ce", "ce_rank", "ce_gap", "ce_max_other",
-         "ce_available"]
+BASE_FEATS = ["prob", "prob_rank", "prob_gap", "prob_n_above"]
+CE_FEATS = ["ce", "ce_rank", "ce_gap", "ce_max_other", "ce_available"]
 
 
-def stack_features(df, ce):
-    d = df.join(ce, on=["i", "j"], how="left")
-    p, c = pl.col("prob"), pl.col("ce")
-    return d.with_columns(
+def feats_for(names):
+    """one block of reranker features per reranker (names: column suffixes, e.g. ['', '_mdeb'])"""
+    return BASE_FEATS + [f + n for n in names for f in CE_FEATS]
+
+
+FEATS = feats_for([""])
+
+
+def stack_features(df, ce, names=("",)):
+    """ce: one table (i, j, ce) or a list of them, one per reranker; names: suffix for each reranker's columns"""
+    ces = ce if isinstance(ce, (list, tuple)) else [ce]
+    d = df
+    for t, n in zip(ces, names):
+        d = d.join(t.rename({"ce": "ce" + n}), on=["i", "j"], how="left")
+    p = pl.col("prob")
+    d = d.with_columns(
         p.rank("min", descending=True).over("i").cast(pl.Float32).alias("prob_rank"),
         (p.max().over("i") - p).alias("prob_gap"),
-        (p > 0.5).sum().over("i").cast(pl.Float32).alias("prob_n_above"),
-        c.rank("min", descending=True).over("i").cast(pl.Float32).alias("ce_rank"),
-        (c.max().over("i") - c).alias("ce_gap"),
-        c.is_not_null().cast(pl.Float32).alias("ce_available"),
-    ).with_columns(  # best CE score of the S1's OTHER candidates
-        pl.when(pl.col("ce_rank") == 1).then(c.sort(descending=True, nulls_last=True).slice(1, 1).first().over("i"))
-        .otherwise(c.max().over("i")).alias("ce_max_other"))
+        (p > 0.5).sum().over("i").cast(pl.Float32).alias("prob_n_above"))
+    for n in names:
+        c = pl.col("ce" + n)
+        d = d.with_columns(
+            c.rank("min", descending=True).over("i").cast(pl.Float32).alias("ce_rank" + n),
+            (c.max().over("i") - c).alias("ce_gap" + n),
+            c.is_not_null().cast(pl.Float32).alias("ce_available" + n),
+        ).with_columns(  # best score of the S1's OTHER candidates
+            pl.when(pl.col("ce_rank" + n) == 1).then(c.sort(descending=True, nulls_last=True).slice(1, 1).first().over("i"))
+            .otherwise(c.max().over("i")).alias("ce_max_other" + n))
+    return d
 
 
 def main():
@@ -49,8 +65,13 @@ def main():
     W = C.WORK_DIR
     oof = pl.read_parquet(os.path.join(W, "train_oof.parquet"))
     G_pl = pl.read_parquet(os.path.join(W, "train_G.parquet"))
-    ce_tr = pl.read_parquet(os.path.join(W, f"ce_train{a.suffix or a.tag}.parquet")).drop_nulls("ce").filter(pl.col("ce").is_not_nan())
-    tr = stack_features(oof, ce_tr)
+    tags = (a.suffix or a.tag).split(",")          # several rerankers: --tag _qwen,_mdeb
+    names = [""] if len(tags) == 1 else tags
+    feats = feats_for(names)
+    ce_trs = [pl.read_parquet(os.path.join(W, f"ce_train{t}.parquet")).drop_nulls("ce").filter(pl.col("ce").is_not_nan())
+              for t in tags]
+    ce_tr = ce_trs[0]
+    tr = stack_features(oof, ce_trs, names)
     if a.suffix:  # smoke: evaluate only on S1s the CE saw
         tr = tr.filter(pl.col("i").is_in(ce_tr["i"].unique()))
     df = tr.to_pandas()
@@ -71,10 +92,10 @@ def main():
     oof2, iters = np.zeros(len(df)), []
     for f in range(C.N_FOLDS):
         trm, vam = (df["sfold"] != f).values, (df["sfold"] == f).values
-        dtr = lgb.Dataset(df.loc[trm, FEATS], df.loc[trm, "label"].astype(int))
-        dva = lgb.Dataset(df.loc[vam, FEATS], df.loc[vam, "label"].astype(int), reference=dtr)
+        dtr = lgb.Dataset(df.loc[trm, feats], df.loc[trm, "label"].astype(int))
+        dva = lgb.Dataset(df.loc[vam, feats], df.loc[vam, "label"].astype(int), reference=dtr)
         m = lgb.train(params, dtr, 2000, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)])
-        oof2[vam] = m.predict(df.loc[vam, FEATS], num_iteration=m.best_iteration)
+        oof2[vam] = m.predict(df.loc[vam, feats], num_iteration=m.best_iteration)
         iters.append(m.best_iteration)
     df["prob"] = oof2
     print("stage-2 decision tuning:")
@@ -84,23 +105,23 @@ def main():
         return
 
     n_rounds = int(np.mean(iters) * 1.1) + 1
-    model = lgb.train(params, lgb.Dataset(df[FEATS], df["label"].astype(int)), n_rounds)
+    model = lgb.train(params, lgb.Dataset(df[feats], df["label"].astype(int)), n_rounds)
     # test set: 49.6M pairs, so score in S1 chunks (all features are within-S1, so chunking is exact)
     scored = pl.read_parquet(os.path.join(W, "test_scored.parquet"))
-    ce_te = pl.read_parquet(os.path.join(W, f"ce_test{a.tag}.parquet"))
+    ce_tes = [pl.read_parquet(os.path.join(W, f"ce_test{t}.parquet")) for t in tags]
     s1 = scored["i"].unique().sort()
     parts, step = [], 300_000
     for a0 in range(0, len(s1), step):
         ch = scored.filter(pl.col("i").is_in(s1[a0:a0 + step].implode()))
-        f = stack_features(ch, ce_te)
-        p2 = model.predict(f.select(FEATS).to_numpy())
+        f = stack_features(ch, ce_tes, names)
+        p2 = model.predict(f.select(feats).to_numpy())
         parts.append(f.select("i", "j").with_columns(pl.Series("prob", p2.astype(np.float32))))
         print(f"  stage-2 scored S1 {min(a0 + step, len(s1))}/{len(s1)}", flush=True)
-    pl.concat(parts).write_parquet(os.path.join(W, f"test_scored_stage2{a.tag}.parquet"))
-    cfg.update(features=FEATS, n_rounds=n_rounds, stage=2)
-    with open(os.path.join(W, f"decision_stage2{a.tag}.json"), "w") as f:
+    pl.concat(parts).write_parquet(os.path.join(W, f"test_scored_stage2{a.tag.replace(',', '')}.parquet"))
+    cfg.update(features=feats, n_rounds=n_rounds, stage=2)
+    with open(os.path.join(W, f"decision_stage2{a.tag.replace(',', '')}.json"), "w") as f:
         json.dump(cfg, f, indent=1)
-    print(f"saved work/test_scored_stage2{a.tag}.parquet -> python src/run_pipeline.py --reuse --stage2 --stage2_tag {a.tag}")
+    print(f"saved work/test_scored_stage2{a.tag.replace(',', '')}.parquet -> python src/run_pipeline.py --reuse --stage2 --stage2_tag {a.tag.replace(',', '')}")
 
 
 if __name__ == "__main__":

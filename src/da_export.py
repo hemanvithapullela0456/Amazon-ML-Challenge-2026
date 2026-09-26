@@ -46,11 +46,25 @@ def pseudo(df, tag, n=150_000, hi=0.97, lo=0.03):
     return keyed(out.select("i", "j", "pl_label"), tag)
 
 
+def implied(scores, checked, tag, top=2, hi=0.99):
+    """Transitive-consistency pairs (TransClean-style): each checked candidate j of an S1 i is paired with the
+    S1's top confident copies k (teacher prob > hi, record's best S1), k != j. A true copy should look like
+    the S1's other copies; a look-alike sibling should not. Needs no label."""
+    conf = (scores.filter((pl.col("prob") > hi) & (pl.col("prob") >= pl.col("prob").max().over("j")))
+            .sort("i", "prob", descending=[False, True]).group_by("i", maintain_order=True).head(top)
+            .select("i", pl.col("j").alias("k")))
+    imp = (checked.select("i", "j").unique().join(conf, on="i").filter(pl.col("j") != pl.col("k"))
+           .select("i", "j", "k").unique(["j", "k"]))
+    return imp.with_columns((pl.lit(tag + ":") + pl.col("j").cast(pl.Utf8)).alias("ka"),
+                            (pl.lit(tag + ":") + pl.col("k").cast(pl.Utf8)).alias("kb"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["proxy", "france"], required=True)
     ap.add_argument("--lo", type=float, default=0.01)
     ap.add_argument("--hi", type=float, default=0.99)
+    ap.add_argument("--france_scores", default="test_scored_unseen.parquet", help="France teacher scores (work/)")
     a = ap.parse_args()
     W = C.WORK_DIR
     out = os.path.join(W, f"da_{a.mode}")
@@ -70,24 +84,32 @@ def main():
         tgt = keyed(tgt, "tr").with_columns(pl.col("i").is_in(list(bad)).not_().alias("latin"),
                                             pl.col("prob").alias("p_lgbm")).select("ka", "kb", "i", "j", "label", "p_lgbm", "latin")
         ps = pseudo(ev.select("i", "j", "prob"), "tr")
+        ex = keyed(ev.filter((pl.col("prob") > a.hi) & (pl.col("prob") >= pl.col("prob").max().over("j"))), "tr").select("ka", "kb", "i", "j", "label")
+        im = implied(ev.select("i", "j", "prob"), pl.concat([tgt.select("i", "j"), ex.select("i", "j")]), "tr")
         acc = ps.join(ev.select("i", "j", "label"), on=["i", "j"]).select(
             ((pl.col("pl_label") > 0.5) == pl.col("label")).mean()).item()
         print(f"[proxy] teacher pseudo-labels {ps.height} (agree with the hidden truth {acc:.4f} - reported only)")
         rows = pl.concat([bundle.filter(pl.col("country_key") == "us")["i"], bundle.filter(pl.col("country_key") == "us")["j"],
-                          tgt["i"], tgt["j"], ps["i"], ps["j"]]).unique()
+                          tgt["i"], tgt["j"], ps["i"], ps["j"], ex["i"], ex["j"], im["k"]]).unique()
         tx = texts("train", rows, "tr")
     else:
         src = keyed(bundle, "tr").select("ka", "kb", "label")
-        sc = pl.read_parquet(os.path.join(W, "test_scored_unseen.parquet"))
+        sc = pl.read_parquet(os.path.join(W, a.france_scores))
         tgt = keyed(sc.filter((pl.col("prob") >= a.lo) & (pl.col("prob") <= a.hi)), "te").with_columns(
             pl.col("prob").alias("p_lgbm")).select("ka", "kb", "i", "j", "p_lgbm")
         ps = pseudo(sc, "te")
+        ex = keyed(sc.filter((pl.col("prob") > a.hi) & (pl.col("prob") >= pl.col("prob").max().over("j"))), "te").select("ka", "kb", "i", "j")
+        im = implied(sc.select("i", "j", "prob"), pl.concat([tgt.select("i", "j"), ex.select("i", "j")]), "te")
         tx = pl.concat([texts("train", pl.concat([bundle["i"], bundle["j"]]).unique(), "tr"),
-                        texts("test", pl.concat([tgt["i"], tgt["j"], ps["i"], ps["j"]]).unique(), "te")])
+                        texts("test", pl.concat([tgt["i"], tgt["j"], ps["i"], ps["j"], ex["i"], ex["j"], im["k"]]).unique(), "te")])
     src.write_parquet(os.path.join(out, "src_pairs.parquet"))
     tgt.write_parquet(os.path.join(out, "tgt_pairs.parquet"))
     tx.write_parquet(os.path.join(out, "texts.parquet"))
     ps.select("ka", "kb", "pl_label").write_parquet(os.path.join(out, "tgt_pseudo.parquet"))
+    ex.write_parquet(os.path.join(out, "extra_pairs.parquet"))
+    im.write_parquet(os.path.join(out, "implied_pairs.parquet"))
+    print(f"[{a.mode}] implied (transitive-consistency) pairs: {im.height} for {im['j'].n_unique()} candidates")
+    print(f"[{a.mode}] extra (teacher-confident, one-to-one) pairs for the student veto: {ex.height}")
     extra = f", latin {int(tgt['latin'].sum())}, match rate {tgt['label'].mean():.3f}" if a.mode == "proxy" else ""
     print(f"[{a.mode}] source {src.height} labelled pairs | target {tgt.height} pairs{extra} | texts {tx.height} -> {out}")
 

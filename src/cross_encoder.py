@@ -228,7 +228,9 @@ def main():
     test_folds = [int(x) for x in a.test_folds.split(",")] if a.test_folds else folds
     test_folds = [f for f in folds if f in test_folds]
     if te_pairs is not None and not test_folds:
-        raise SystemExit(f"--test_folds {a.test_folds} names no fold that this run trains ({folds})")
+        # this process trains folds that do not score the test set (another process does): skip test scoring
+        print(f"no test scoring in this process (test folds {a.test_folds}, trained folds {folds})", flush=True)
+        te_pairs = None
     for f in folds:
         t = time.time()
         tr = tr_pairs.filter(pl.col("cefold") != f)
