@@ -187,6 +187,7 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--scramble", type=float, default=0.0, help="share of training lists whose vocabulary is scrambled")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--val_fold", type=int, default=0, help="CE fold held out and scored (train on the other two)")
     ap.add_argument("--train_country", default="", help="train only on this country's lists (transfer test)")
     ap.add_argument("--test_lists", default="test_lists.parquet")
     ap.add_argument("--test_texts", default="test_texts.parquet")
@@ -216,7 +217,7 @@ def main():
         print(f"vocabulary scrambling on {a.scramble:.0%} of training lists ({len(SCR['pool'])} replacement sub-words)", flush=True)
     texts = pl.read_parquet(os.path.join(a.bundle, "train_texts.parquet"))
     toks = encode_texts(tok, dict(zip(texts["r"].to_list(), texts["text"].to_list())))
-    fit = tr.filter(pl.col("cefold") != 0)
+    fit = tr.filter(pl.col("cefold") != a.val_fold)
     if a.train_country:
         fit = fit.filter(pl.col("country_key") == a.train_country)
     fit_l = to_lists(fit, True)
@@ -236,7 +237,7 @@ def main():
         fit_l = fit_l + pl_lists
         print(f"+ {len(pl_lists)} teacher-labelled target lists ({int(np.nansum(ps['label'].to_numpy()))} positive labels, "
               f"{int(np.isnan(ps['label'].to_numpy()).sum())} context-only candidates)", flush=True)
-    val_l = to_lists(tr.filter(pl.col("cefold") == 0), True)
+    val_l = to_lists(tr.filter(pl.col("cefold") == a.val_fold), True)
     print(f"train lists {len(fit_l)} | validation lists {len(val_l)} | tokenized ({time.time() - t0:.0f}s)", flush=True)
 
     model = SetModel(a.model, len(tok)).to(dev)

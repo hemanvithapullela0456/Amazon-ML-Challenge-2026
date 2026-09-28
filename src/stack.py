@@ -120,8 +120,9 @@ def main():
     fold_of = pd.Series(rng.permutation(len(s1_ids)) % C.N_FOLDS, index=s1_ids)
     df["sfold"] = fold_of.reindex(df["i"].values).values
     df["prob1"] = df["prob"]
-    params = dict(objective="binary", learning_rate=0.05, num_leaves=31, min_data_in_leaf=200,
-                  feature_fraction=0.9, verbose=-1, num_threads=C.N_JOBS, seed=C.SEED)
+    params = dict(objective="binary", learning_rate=float(os.environ.get("STACK_LR", 0.05)),
+                  num_leaves=int(os.environ.get("STACK_LEAVES", 31)), min_data_in_leaf=int(os.environ.get("STACK_MINLEAF", 200)),
+                  feature_fraction=float(os.environ.get("STACK_FF", 0.9)), verbose=-1, num_threads=C.N_JOBS, seed=C.SEED)
     oof2, iters = np.zeros(len(df)), []
     for f in range(C.N_FOLDS):
         trm, vam = (df["sfold"] != f).values, (df["sfold"] == f).values
@@ -137,8 +138,8 @@ def main():
             oof2[vam] = m.predict(df.loc[vam, feats], num_iteration=m.best_iteration)
         iters.append(m.best_iteration)
     df["prob"] = oof2
-    if a.suffix or a.eval_only:   # out-of-fold stage-2 probabilities for decision-layer experiments
-        df[["i", "j", "label", "prob"]].to_parquet(os.path.join(W, f"stack_oof{(a.suffix or a.tag).replace(',', '')}"
+    if a.suffix or a.eval_only or a.out_prefix:   # out-of-fold stage-2 probabilities for decision-layer experiments
+        df[["i", "j", "label", "prob"]].to_parquet(os.path.join(W, f"{a.out_prefix}stack_oof{(a.suffix or a.tag).replace(',', '')}"
                                                        f"{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}{'_owner' if a.owner else ''}.parquet"))
     print("stage-2 decision tuning:")
     cfg = decide.tune(df, G, s1_ids, try_expected=not a.no_expected)
