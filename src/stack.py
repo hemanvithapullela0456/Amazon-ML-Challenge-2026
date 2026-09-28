@@ -64,6 +64,13 @@ def main():
                     help="full run: fit the stack only on S1s the FIRST reranker scored (one that has OOF on one fold only)")
     ap.add_argument("--graph", action="store_true", help="add graph/consensus features (work/graph_{train,test}.parquet)")
     ap.add_argument("--moves", action="store_true", help="add generator-move / alias features (work/moves_{train,test}.parquet)")
+    ap.add_argument("--owner", action="store_true",
+                    help="add same-name owner-choice features for name-only copies (work/owner_{train,test}.parquet)")
+    ap.add_argument("--out_prefix", default="", help="prefix for the test score file (reproducibility checks)")
+    ap.add_argument("--owner_file", default="owner_train.parquet")
+    ap.add_argument("--owner_val", default="",
+                    help="evaluation only: owner features used when PREDICTING the held-out folds (e.g. computed with "
+                         "hidden S1s), while the model is trained on --owner_file")
     ap.add_argument("--no-expected", action="store_true", help="skip the (slow) expected-F0.5 selector while tuning")
     a = ap.parse_args()
     W = C.WORK_DIR
@@ -89,6 +96,15 @@ def main():
         tr = tr.join(m_tr, on=["i", "j"], how="left")
         feats = feats + mfe
         print(f"move features: {len(mfe)}")
+    if a.owner:
+        o_tr = pl.read_parquet(os.path.join(W, a.owner_file))
+        ofe = [c for c in o_tr.columns if c not in ("i", "j")]
+        tr = tr.join(o_tr, on=["i", "j"], how="left")
+        if a.owner_val:
+            o_va = pl.read_parquet(os.path.join(W, a.owner_val)).select(["i", "j"] + ofe)
+            tr = tr.join(o_va.rename({c: c + "__v" for c in ofe}), on=["i", "j"], how="left")
+        feats = feats + ofe
+        print(f"owner features: {len(ofe)} on {o_tr.height} name-only pairs")
     if a.suffix or a.restrict:  # evaluate / fit only on S1s the first CE saw
         tr = tr.filter(pl.col("i").is_in(ce_tr["i"].unique()))
     df = tr.to_pandas()
@@ -112,9 +128,18 @@ def main():
         dtr = lgb.Dataset(df.loc[trm, feats], df.loc[trm, "label"].astype(int))
         dva = lgb.Dataset(df.loc[vam, feats], df.loc[vam, "label"].astype(int), reference=dtr)
         m = lgb.train(params, dtr, 2000, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)])
-        oof2[vam] = m.predict(df.loc[vam, feats], num_iteration=m.best_iteration)
+        if a.owner and a.owner_val:
+            xv = df.loc[vam, feats].copy()
+            for c in ofe:
+                xv[c] = df.loc[vam, c + "__v"].values
+            oof2[vam] = m.predict(xv, num_iteration=m.best_iteration)
+        else:
+            oof2[vam] = m.predict(df.loc[vam, feats], num_iteration=m.best_iteration)
         iters.append(m.best_iteration)
     df["prob"] = oof2
+    if a.suffix or a.eval_only:   # out-of-fold stage-2 probabilities for decision-layer experiments
+        df[["i", "j", "label", "prob"]].to_parquet(os.path.join(W, f"stack_oof{(a.suffix or a.tag).replace(',', '')}"
+                                                       f"{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}{'_owner' if a.owner else ''}.parquet"))
     print("stage-2 decision tuning:")
     cfg = decide.tune(df, G, s1_ids, try_expected=not a.no_expected)
     print(f"stage-1 F0.5 on these S1: {base:.5f}  ->  stage-2 F0.5: {cfg['cv_f05']:.5f}")
@@ -128,6 +153,7 @@ def main():
     ce_tes = [pl.read_parquet(os.path.join(W, f"ce_test{t}.parquet")) for t in tags]
     g_te = pl.read_parquet(os.path.join(W, "graph_test.parquet")) if a.graph else None
     m_te = pl.read_parquet(os.path.join(W, "moves_test.parquet")) if a.moves else None
+    o_te = pl.read_parquet(os.path.join(W, "owner_test.parquet")) if a.owner else None
     s1 = scored["i"].unique().sort()
     parts, step = [], 300_000
     for a0 in range(0, len(s1), step):
@@ -137,12 +163,14 @@ def main():
             f = f.join(g_te, on=["i", "j"], how="left")
         if m_te is not None:
             f = f.join(m_te, on=["i", "j"], how="left")
+        if o_te is not None:
+            f = f.join(o_te, on=["i", "j"], how="left")
         p2 = model.predict(f.select(feats).to_numpy())
         parts.append(f.select("i", "j").with_columns(pl.Series("prob", p2.astype(np.float32))))
         print(f"  stage-2 scored S1 {min(a0 + step, len(s1))}/{len(s1)}", flush=True)
-    pl.concat(parts).write_parquet(os.path.join(W, f"test_scored_stage2{a.tag.replace(',', '')}{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}.parquet"))
+    pl.concat(parts).write_parquet(os.path.join(W, f"{a.out_prefix}test_scored_stage2{a.tag.replace(',', '')}{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}{'_owner' if a.owner else ''}.parquet"))
     cfg.update(features=feats, n_rounds=n_rounds, stage=2)
-    with open(os.path.join(W, f"decision_stage2{a.tag.replace(',', '')}{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}.json"), "w") as f:
+    with open(os.path.join(W, f"decision_stage2{a.tag.replace(',', '')}{'_graph' if a.graph else ''}{'_moves' if a.moves else ''}{'_owner' if a.owner else ''}.json"), "w") as f:
         json.dump(cfg, f, indent=1)
     print(f"saved work/test_scored_stage2{a.tag.replace(',', '')}.parquet -> python src/run_pipeline.py --reuse --stage2 --stage2_tag {a.tag.replace(',', '')}")
 
