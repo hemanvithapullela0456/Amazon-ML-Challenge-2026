@@ -147,6 +147,9 @@ def main():
         return
 
     n_rounds = int(np.mean(iters) * 1.1) + 1
+    # BUGFIX 27 Sep: "prob" was overwritten by the stage-2 OOF probability above, so the final model used to be
+    # trained on stage-2 probs but applied to stage-1 probs at test time (compressed, stage-1-driven test scores).
+    df["prob"] = df["prob1"]
     model = lgb.train(params, lgb.Dataset(df[feats], df["label"].astype(int)), n_rounds)
     # test set: 49.6M pairs, so score in S1 chunks (all features are within-S1, so chunking is exact)
     scored = pl.read_parquet(os.path.join(W, "test_scored.parquet"))
