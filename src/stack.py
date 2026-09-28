@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--moves", action="store_true", help="add generator-move / alias features (work/moves_{train,test}.parquet)")
     ap.add_argument("--owner", action="store_true",
                     help="add same-name owner-choice features for name-only copies (work/owner_{train,test}.parquet)")
+    ap.add_argument("--coloc", action="store_true", help="add co-location features (work/coloc_pairs_{train,test}.parquet)")
     ap.add_argument("--out_prefix", default="", help="prefix for the test score file (reproducibility checks)")
     ap.add_argument("--owner_file", default="owner_train.parquet")
     ap.add_argument("--owner_val", default="",
@@ -105,6 +106,12 @@ def main():
             tr = tr.join(o_va.rename({c: c + "__v" for c in ofe}), on=["i", "j"], how="left")
         feats = feats + ofe
         print(f"owner features: {len(ofe)} on {o_tr.height} name-only pairs")
+    if a.coloc:
+        c_tr = pl.read_parquet(os.path.join(W, "coloc_pairs_train.parquet"))
+        cfe = [c for c in c_tr.columns if c not in ("i", "j")]
+        tr = tr.join(c_tr, on=["i", "j"], how="left")
+        feats = feats + cfe
+        print(f"coloc features: {len(cfe)} on {c_tr.height} pairs")
     if a.suffix or a.restrict:  # evaluate / fit only on S1s the first CE saw
         tr = tr.filter(pl.col("i").is_in(ce_tr["i"].unique()))
     df = tr.to_pandas()
@@ -158,6 +165,7 @@ def main():
     g_te = pl.read_parquet(os.path.join(W, "graph_test.parquet")) if a.graph else None
     m_te = pl.read_parquet(os.path.join(W, "moves_test.parquet")) if a.moves else None
     o_te = pl.read_parquet(os.path.join(W, "owner_test.parquet")) if a.owner else None
+    c_te = pl.read_parquet(os.path.join(W, "coloc_pairs_test.parquet")) if a.coloc else None
     s1 = scored["i"].unique().sort()
     parts, step = [], 300_000
     for a0 in range(0, len(s1), step):
@@ -169,6 +177,8 @@ def main():
             f = f.join(m_te, on=["i", "j"], how="left")
         if o_te is not None:
             f = f.join(o_te, on=["i", "j"], how="left")
+        if c_te is not None:
+            f = f.join(c_te, on=["i", "j"], how="left")
         p2 = model.predict(f.select(feats).to_numpy())
         parts.append(f.select("i", "j").with_columns(pl.Series("prob", p2.astype(np.float32))))
         print(f"  stage-2 scored S1 {min(a0 + step, len(s1))}/{len(s1)}", flush=True)
